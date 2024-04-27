@@ -1,0 +1,251 @@
+---
+title: "TorioRNASeqSeurat"
+author: "Lyndon Torio"
+date: "2024-04-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+```
+
+I will be going through the cell cycle regression and  differential expression testing vignette for Seurat (https://satijalab.org/seurat/articles/get_started.html). the DE testing vignette used data from the SeuratData package, installed from github using the command devtools::install_github('satijalab/seurat-data') which in turn required the devtools package. 
+
+
+## Cell-Cycle Scoring and Regression
+
+https://satijalab.org/seurat/articles/cell_cycle_vignette
+
+First I download, unzip, and move the provided data set of murine hematopoietic progenitors to my working directory so that the data can be used in R (Nestorowa et al., Blood 2016).  
+
+```{r rawDataCellCycle}
+# Read in the expression matrix The first row is a header row, the first column is rownames
+exp.mat <- read.table(file = "cell_cycle_vignette_files/nestorawa_forcellcycle_expressionMatrix.txt",header = TRUE, as.is = TRUE, row.names = 1)
+```
+
+Then I load the cc.genes data set that is included with Seurat. The cc.genes data contains cell cycle markers but we are only interested in the markers of G2/M phase and markers of S phase.
+```{r Markers}
+# specifically loading the cc.genes data set that should come with Seurat
+# this line was not included in the original vignette but cc.genes did not load by default
+data("cc.genes", package = "Seurat")
+
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+s.genes <- cc.genes$s.genes # S phase markers
+g2m.genes <- cc.genes$g2m.genes # G2/M phase markers
+```
+
+Next I create a Seurat object from the provided data.
+```{r seuratObject}
+# Create our Seurat object and complete the initialization steps
+marrow <- CreateSeuratObject(counts = Matrix::Matrix(as.matrix(exp.mat), sparse = T))
+marrow <- NormalizeData(marrow)
+marrow <- FindVariableFeatures(marrow, selection.method = "vst")
+marrow <- ScaleData(marrow, features = rownames(marrow))
+```
+
+
+Here is what happens when you run a PCA on the data without accounting for cell cycle heterogeneity. We see cell cycle genes, like OP2A and MKI67, contributing to PC_8 and PC_10.
+```{r defaultPCA}
+marrow <- RunPCA(marrow, features = VariableFeatures(marrow), ndims.print = 6:10, nfeatures.print = 10)
+DimHeatmap(marrow, dims = c(8, 10))
+```
+Now I assign cell cycle scores based on the marks from s.genes and g2m.genes which contain S phase and G2/M phase markers respectively. 
+```{r cellCycleScores}
+marrow <- CellCycleScoring(marrow, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE) # CellCycleScoring() is used to assign scores
+# view cell cycle scores and phase assignments
+```
+
+The cell cycle scores and their distribution can be seen here.
+```{r vizualizeScores}
+head(marrow[[]])
+# Visualize the distribution of cell cycle markers across
+RidgePlot(marrow, features = c("PCNA", "TOP2A", "MCM6", "MKI67"), ncol = 2)
+```
+
+The cell cycle genes cluster by phase, as expected, when performing a PCA on them.
+```{r pcaOnCellCycleGenes}
+marrow <- RunPCA(marrow, features = c(s.genes, g2m.genes))
+DimPlot(marrow) # visualization
+
+# saving the visualization a jpg
+plot <- DimPlot(marrow) + theme(axis.title = element_text(size = 18), 
+        legend.text = element_text(size = 18)) + guides(colour = guide_legend(override.aes = list(size = 10)))
+ggsave(filename = "cell_cycle_vignette.jpg", 
+       height = 7, width = 12, 
+       plot = plot, quality = 50)
+```
+
+I can now subtract or regress out cell cycle heterogeneity from the data and run a PCA on the variable genes NOT associated with the cell cycle.
+```{r regressionPCA}
+marrow <- ScaleData(marrow, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(marrow))
+
+# this line will take a while to run
+marrow <- RunPCA(marrow, features = VariableFeatures(marrow), nfeatures.print = 10) # this PCA does not return any genes associated with the cell cycle
+
+# PCA's output shows the cells do NOT cluster by cell cycle phase
+marrow <- RunPCA(marrow, features = c(s.genes, g2m.genes)) 
+DimPlot(marrow) 
+```
+
+The above procedure regresses out all signals associated with the G2M and S phases. This may be too extreme, as the cell cycle can be inherently linked to a question of interest (such as with proliferating vs non-proliferating cells). Below is an alternative, regressing out the the difference between G2M and S phase scores.
+
+```{r}
+marrow$CC.Difference <- marrow$S.Score - marrow$G2M.Score # difference in G2M and S phase scores
+marrow <- ScaleData(marrow, vars.to.regress = "CC.Difference", features = rownames(marrow)) # regressing out the the difference in scores
+
+# cell cycle effects strongly mitigated in PCA
+# this line will take a while to run
+marrow <- RunPCA(marrow, features = VariableFeatures(marrow), nfeatures.print = 10)
+
+# when running a PCA on cell cycle genes, actively proliferating cells remain distinct from G1
+# cells however, within actively proliferating cells, G2M and S phase cells group together
+marrow <- RunPCA(marrow, features = c(s.genes, g2m.genes))
+DimPlot(marrow)
+```
+
+## Differential expression testing
+
+https://satijalab.org/seurat/articles/de_vignette
+
+
+First I had to download the interferon-beta stimulated human PBMCs and bring it into R using SeuratData functions.
+```{r SeuratDataifnb}
+# the SeuratData package requires the one time download of data sets with InstallData()
+# the below line of code was NOT included in the vignette procedure
+InstallData("ifnb") 
+
+ifnb <- LoadData("ifnb")
+```
+
+Next I normalized the data and perform  a differential expression test using the default settings comparing Cd 16 and CD14 monocytes.
+```{r dETestCD16CD14}
+# Normalize the data
+ifnb <- NormalizeData(ifnb)
+
+# Find DE features between CD16 Mono and CD1 Mono
+Idents(ifnb) <- "seurat_annotations"
+monocyte.de.markers <- FindMarkers(ifnb, ident.1 = "CD16 Mono", ident.2 = "CD14 Mono") 
+# view results
+head(monocyte.de.markers)
+```
+Here is another differential expression test, this time comparing CD16 against all other cells.
+```{r dETestCD16}
+# the Idents may need to be set for each code chunk that uses FindMarkers
+Idents(ifnb) <- "seurat_annotations"
+
+# Find differentially expressed features between CD14+ Monocytes and all other cells, only
+# search for positive markers
+monocyte.de.markers <- FindMarkers(ifnb, ident.1 = "CD16 Mono", ident.2 = NULL, only.pos = TRUE)
+# view results
+head(monocyte.de.markers)
+```
+
+This differential expression test compares CD14 monocytes across conditions, stimulated and control. The p values are suspect due to 
+```{r dEdifConditions}
+ifnb$celltype.stim <- paste(ifnb$seurat_annotations, ifnb$stim, sep = "_") # creating a column to hold cell type and treatment info
+Idents(ifnb) <- "celltype.stim" # set the current Idents to the newly created celltype.stim column
+
+mono.de <- FindMarkers(ifnb, ident.1 = "CD14 Mono_STIM", ident.2 = "CD14 Mono_CTRL", verbose = FALSE)
+head(mono.de, n = 10)
+```
+
+Before continuing, additional information needs to be downloaded.
+```{r addInfo}
+# load the inferred sample IDs of each cell
+ctrl <- read.table(url("https://raw.githubusercontent.com/yelabucsf/demuxlet_paper_code/master/fig3/ye1.ctrl.8.10.sm.best"), head = T, stringsAsFactors = F)
+stim <- read.table(url("https://raw.githubusercontent.com/yelabucsf/demuxlet_paper_code/master/fig3/ye2.stim.8.10.sm.best"), head = T, stringsAsFactors = F)
+info <- rbind(ctrl, stim)
+
+# rename the cell IDs by substituting the '-' into '.'
+info$BARCODE <- gsub(pattern = "\\-", replacement = "\\.", info$BARCODE)
+
+# only keep the cells with high-confidence sample ID
+info <- info[grep(pattern = "SNG", x = info$BEST), ]
+
+# remove cells with duplicated IDs in both ctrl and stim groups
+info <- info[!duplicated(info$BARCODE) & !duplicated(info$BARCODE, fromLast = T), ]
+
+# now add the sample IDs to ifnb 
+rownames(info) <- info$BARCODE
+info <- info[, c("BEST"), drop = F]
+names(info) <- c("donor_id")
+ifnb <- AddMetaData(ifnb, metadata = info)
+
+# remove cells without donor IDs
+ifnb$donor_id[is.na(ifnb$donor_id)] <- "unknown"
+ifnb <- subset(ifnb, subset = donor_id != "unknown")
+```
+
+
+Pseudobulking is "to sum together gene counts of all the cells from the same sample for each cell type." I preform pseudobulking below. 
+```{r pseudobulk}
+# pseudobulk the counts based on donor-condition-celltype
+pseudo_ifnb <- AggregateExpression(ifnb, assays = "RNA", return.seurat = T, group.by = c("stim", "donor_id", "seurat_annotations"))
+
+# each 'cell' is a donor-condition-celltype pseudobulk profile
+tail(Cells(pseudo_ifnb))
+pseudo_ifnb$celltype.stim <- paste(pseudo_ifnb$seurat_annotations, pseudo_ifnb$stim, sep = "_")
+```
+
+Now I preform a differential expression test on the pseudobulk level for CD14 monocytes using DESeq2. (Note: I had to install the DESeq2 using BiocManager::install("DESeq2"))
+```{r dEPseudobulk}
+Idents(pseudo_ifnb) <- "celltype.stim"
+
+bulk.mono.de <- FindMarkers(object = pseudo_ifnb, 
+                         ident.1 = "CD14 Mono_STIM", 
+                         ident.2 = "CD14 Mono_CTRL",
+                         test.use = "DESeq2")
+head(bulk.mono.de, n = 15)
+```
+
+Comparing teh p values between the single cell level and the pseudo bulk level, there are 3519 differential expressed genes that they share, 1649 genes in only the single cell level, and 204 genes in the bulk level that are also significant.
+```{r pValues}
+# compare the DE P-values between the single-cell level and the pseudobulk level results
+names(bulk.mono.de) <- paste0(names(bulk.mono.de), ".bulk")
+bulk.mono.de$gene <- rownames(bulk.mono.de)
+
+names(mono.de) <- paste0(names(mono.de), ".sc")
+mono.de$gene <- rownames(mono.de)
+
+merge_dat <- merge(mono.de, bulk.mono.de, by = "gene")
+merge_dat <- merge_dat[order(merge_dat$p_val.bulk), ]
+
+# Number of genes that are marginally significant in both; marginally significant only in bulk; and marginally significant only in single-cell
+common <- merge_dat$gene[which(merge_dat$p_val.bulk < 0.05 & 
+                                merge_dat$p_val.sc < 0.05)]
+only_sc <- merge_dat$gene[which(merge_dat$p_val.bulk > 0.05 & 
+                                  merge_dat$p_val.sc < 0.05)]
+only_bulk <- merge_dat$gene[which(merge_dat$p_val.bulk < 0.05 & 
+                                    merge_dat$p_val.sc > 0.05)]
+print(paste0('# Common: ',length(common)))
+print(paste0('# Only in single-cell: ',length(only_sc)))
+print(paste0('# Only in bulk: ',length(only_bulk)))
+```
+
+Here are violin plots of the top differential expressed genes in the pseudobulk and single-cell analyses. These highlight the higher expression in stimulated cells
+```{r goodPlots}
+# create a new column to annotate sample-condition-celltype in the single-cell data set
+ifnb$donor_id.stim <- paste0(ifnb$stim, "-", ifnb$donor_id)
+
+print(merge_dat[merge_dat$gene%in%common[1:2],c('gene','p_val.sc','p_val.bulk')]) # prints p values
+
+# generate violin plot 
+Idents(ifnb) <- "celltype.stim"
+VlnPlot(ifnb, features = common[1:2], idents = c("CD14 Mono_CTRL", "CD14 Mono_STIM"), group.by = "stim") 
+VlnPlot(ifnb, features = common[1:2], idents = c("CD14 Mono_CTRL", "CD14 Mono_STIM"), group.by = "donor_id.stim", ncol = 1) 
+```
+Below are the plots generated from the single-cell analysis of differential expressed genes, where the difference between control and simulated cells is much less apparent.
+```{r}
+print(merge_dat[merge_dat$gene%in%c('SRGN','HLA-DRA'),c('gene','p_val.sc','p_val.bulk')]) # prints p values
+
+# generates violin plots
+VlnPlot(ifnb, features <- c('SRGN','HLA-DRA'), idents = c("CD14 Mono_CTRL", "CD14 Mono_STIM"), group.by = "stim") 
+VlnPlot(ifnb, features <- c('SRGN','HLA-DRA'), idents = c("CD14 Mono_CTRL", "CD14 Mono_STIM"), group.by = "donor_id.stim", ncol = 1) 
+```
